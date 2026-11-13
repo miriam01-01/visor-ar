@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Visor AR</title>
+<style>
+  :root { --verde:#22c55e; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html, body { margin:0; height:100%; background:#111; color:#fff; font-family:system-ui,Arial,sans-serif; }
+
+  #inicio { position:fixed; inset:0; display:flex; flex-direction:column; align-items:center;
+            justify-content:center; gap:16px; padding:24px; text-align:center; }
+  #inicio h1 { margin:0; font-size:24px; }
+  #inicio p { margin:0; color:#bbb; max-width:320px; font-size:15px; line-height:1.4; }
+  button { font:inherit; border:0; border-radius:12px; padding:12px 16px; color:#fff;
+           background:#333; font-weight:600; }
+  #btnIniciar { background:var(--verde); color:#04210f; font-size:18px; padding:16px 28px; }
+  #btnIniciar:disabled { opacity:.5; }
+  #estadoInicio { font-size:14px; color:#ddd; min-height:20px; max-width:320px; }
+
+  #overlay { position:fixed; inset:0; visibility:hidden; pointer-events:none; z-index:5; }
+  #overlay.activo { visibility:visible; }
+  /* Para ver los botones de tamaño/girar/borrar, borra la línea siguiente */
+  #secundarios, #salir { display:none !important; }
+  #overlay > * { pointer-events:auto; }
+  #overlay.activo #btnMostrar { visibility:visible; }
+  #mensaje { position:absolute; top:calc(env(safe-area-inset-top,0px) + 14px); left:50%;
+             transform:translateX(-50%); max-width:88%; background:rgba(20,20,20,.85);
+             padding:12px 18px; border-radius:22px; font-size:15px; font-weight:600;
+             text-align:center; pointer-events:none; }
+  #barra { position:absolute; left:0; right:0; bottom:calc(env(safe-area-inset-bottom,0px) + 14px);
+           display:flex; flex-direction:column; align-items:center; gap:10px; }
+  #btnMostrar { background:var(--verde); color:#04210f; font-size:17px; padding:14px 26px;
+                box-shadow:0 4px 14px rgba(0,0,0,.4); }
+  #btnColor { background:rgba(20,20,20,.85); font-size:15px; padding:10px 18px; }
+  #btnMostrar:disabled { background:#6b7d71; color:#222; }
+  #secundarios { display:flex; gap:6px; flex-wrap:wrap; justify-content:center; padding:0 8px; }
+  #secundarios button { background:rgba(20,20,20,.8); padding:9px 12px; font-size:14px; }
+  #salir { position:absolute; top:calc(env(safe-area-inset-top,0px) + 14px); right:12px;
+           background:rgba(20,20,20,.8); padding:8px 12px; }
+</style>
+<script type="importmap">
+{ "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+
+<div id="inicio">
+  <h1>Visor AR</h1>
+  <p>Abre la cámara y apunta al piso. Cuando aparezca el círculo verde, pulsa "Mostrar Modelo aquí".</p>
+  <button id="btnIniciar" disabled>Abrir cámara AR</button>
+  <div id="estadoInicio">Comprobando AR...</div>
+</div>
+
+<div id="overlay">
+  <div id="mensaje">Mueve el celular despacio para detectar el piso</div>
+  <button id="salir">Salir</button>
+  <div id="barra">
+    <button id="btnColor">Color: Azul</button>
+    <button id="btnMostrar" disabled>Mostrar Modelo aquí</button>
+    <div id="secundarios">
+      <button id="btnMas">+ Tamaño</button>
+      <button id="btnMenos">− Tamaño</button>
+      <button id="btnGirar">Girar</button>
+      <button id="btnBorrar">Borrar</button>
+    </div>
+  </div>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
+import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
+
+/* ====== Tu modelo: debe estar en la MISMA carpeta que este index.html ====== */
+const ARCHIVO = 'modelo4.glb';
+const TAMANO_INICIAL = 1.2;   // metros (lado más grande del modelo)
+/* ========================================================================== */
+
+const $ = id => document.getElementById(id);
+const overlay = $('overlay'), mensaje = $('mensaje'), btnMostrar = $('btnMostrar');
+
+let renderer, scene, camera, reticle, session = null;
+let hitSource = null, hitDisponible = false;
+let colocado = null, ultimaPos = null, escala = 1, girando = false;
+let base = null;            // modelo ya cargado
+const COLORES = [
+  { nombre: 'Azul',     hex: 0x3b82f6 },
+  { nombre: 'Rojo',     hex: 0xef4444 },
+  { nombre: 'Amarillo', hex: 0xfacc15 },
+  { nombre: 'Verde',    hex: 0x22c55e },
+  { nombre: 'Morado',   hex: 0xa855f7 },
+  { nombre: 'Original', hex: null }
+];
+let colorIdx = 0;
+const loader = new GLTFLoader();
+const draco = new DRACOLoader();
+draco.setDecoderPath('https://www.gstatic.com/draco/versioned/decoders/1.5.6/');
+loader.setDRACOLoader(draco);
+loader.setMeshoptDecoder(MeshoptDecoder);
+loader.setRequestHeader({ 'ngrok-skip-browser-warning': '1' });
+const detalle = e => (e && (e.message || (e.target && e.target.status) || e.type)) || String(e);
+
+/* ---------- Carga del modelo ---------- */
+function cargar(alProgreso) {
+  if (base) return Promise.resolve(base);
+  return new Promise((ok, fallo) => {
+    loader.load(ARCHIVO, gltf => {
+      const obj = gltf.scene;
+      const caja = new THREE.Box3().setFromObject(obj);
+      const size = caja.getSize(new THREE.Vector3());
+      const centro = caja.getCenter(new THREE.Vector3());
+      const k = TAMANO_INICIAL / Math.max(size.x, size.y, size.z);
+      obj.position.sub(new THREE.Vector3(centro.x, caja.min.y, centro.z));
+      const grupo = new THREE.Group();
+      grupo.add(obj);
+      // Guardar colores originales para poder restaurarlos
+      obj.traverse(m => {
+        if (!m.isMesh) return;
+        (Array.isArray(m.material) ? m.material : [m.material]).forEach(mat => {
+          if (mat.color && !mat.userData.orig) { mat.userData.orig = mat.color.clone(); mat.userData.map = mat.map; }
+        });
+      });
+      // Plano cuadrado en el piso, como en el dibujo: el objeto parado encima
+      const lado = Math.max(size.x, size.z) * 1.8;
+      const plano = new THREE.Mesh(
+        new THREE.PlaneGeometry(lado, lado).rotateX(-Math.PI / 2),
+        new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.18,
+                                      side: THREE.DoubleSide, depthWrite: false }));
+      const borde = new THREE.LineSegments(
+        new THREE.EdgesGeometry(plano.geometry),
+        new THREE.LineBasicMaterial({ color: 0x22ff77 }));
+      plano.position.y = borde.position.y = size.y * 0.002;
+      grupo.add(plano, borde);
+      aplicarColor(obj);
+      grupo.userData.base = k;
+      grupo.scale.setScalar(k);
+      base = grupo;
+      ok(grupo);
+    }, e => { if (e.total && alProgreso) alProgreso(Math.round(e.loaded / e.total * 100)); },
+    err => fallo(err));
+  });
+}
+
+/* ---------- Color del objeto ---------- */
+function aplicarColor(obj) {
+  const c = COLORES[colorIdx];
+  obj.traverse(m => {
+    if (!m.isMesh) return;
+    (Array.isArray(m.material) ? m.material : [m.material]).forEach(mat => {
+      if (!mat.color || !mat.userData.orig) return;
+      if (c.hex === null) { mat.color.copy(mat.userData.orig); mat.map = mat.userData.map; }
+      else { mat.color.set(c.hex); mat.map = null; }
+      mat.needsUpdate = true;
+    });
+  });
+}
+$('btnColor').addEventListener('click', () => {
+  colorIdx = (colorIdx + 1) % COLORES.length;
+  $('btnColor').textContent = 'Color: ' + COLORES[colorIdx].nombre;
+  if (base) aplicarColor(base.children[0]);
+});
+
+async function precargar() {
+  const est = $('estadoInicio');
+  est.textContent = 'Descargando modelo...';
+  try {
+    await cargar(p => est.textContent = `Descargando modelo: ${p}%`);
+    est.textContent = 'Modelo listo';
+  } catch (e) {
+    est.textContent = `No se pudo cargar ${ARCHIVO} (${detalle(e)}). Revisa que esté junto al index.html.`;
+  }
+}
+
+/* ---------- Three.js / WebXR ---------- */
+function iniciarThree() {
+  renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+  renderer.setPixelRatio(window.devicePixelRatio);
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.xr.enabled = true;
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+  renderer.domElement.style.cssText = 'position:fixed;inset:0;z-index:0';
+  document.body.appendChild(renderer.domElement);
+
+  scene = new THREE.Scene();
+  camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.01, 50);
+
+  scene.add(new THREE.HemisphereLight(0xffffff, 0x888888, 2.2));
+  const sol = new THREE.DirectionalLight(0xffffff, 2);
+  sol.position.set(1, 3, 2);
+  scene.add(sol);
+
+  reticle = new THREE.Mesh(
+    new THREE.RingGeometry(0.12, 0.16, 40).rotateX(-Math.PI / 2),
+    new THREE.MeshBasicMaterial({ color: 0x22ff77 }));
+  reticle.matrixAutoUpdate = false;
+  reticle.visible = false;
+  scene.add(reticle);
+
+  renderer.setAnimationLoop(dibujar);
+  window.addEventListener('resize', () => renderer.setSize(innerWidth, innerHeight));
+}
+
+function dibujar(t, frame) {
+  if (frame && session) {
+    const refSpace = renderer.xr.getReferenceSpace();
+    if (hitSource) {
+      const hits = frame.getHitTestResults(hitSource);
+      if (hits.length) {
+        const pose = hits[0].getPose(refSpace);
+        reticle.visible = true;
+        reticle.matrix.fromArray(pose.transform.matrix);
+        if (!hitDisponible) {
+          hitDisponible = true;
+          btnMostrar.disabled = false;
+          if (!colocado) mensaje.textContent = "Superficie detectada. Pulsa 'Mostrar Modelo aquí'";
+        }
+      } else {
+        reticle.visible = false;
+        if (hitDisponible) {
+          hitDisponible = false;
+          btnMostrar.disabled = true;
+          if (!colocado) mensaje.textContent = 'Mueve el celular despacio para detectar el piso';
+        }
+      }
+    }
+  }
+  if (colocado && girando) colocado.rotation.y += 0.01;
+  renderer.render(scene, camera);
+}
+
+/* ---------- Colocar el modelo ---------- */
+async function colocarModelo() {
+  if (hitSource) {
+    if (!reticle.visible) return;
+    ultimaPos = new THREE.Vector3().setFromMatrixPosition(reticle.matrix);
+  } else {
+    const cam = renderer.xr.getCamera();
+    const dir = new THREE.Vector3();
+    cam.getWorldDirection(dir);
+    dir.y = 0; dir.normalize();
+    ultimaPos = cam.position.clone().addScaledVector(dir, 1.5);
+    ultimaPos.y = cam.position.y - 1.3;
+  }
+  if (!base) mensaje.textContent = 'Descargando modelo...';
+  try { await cargar(p => mensaje.textContent = `Descargando modelo: ${p}%`); }
+  catch (e) { mensaje.textContent = `No se pudo cargar ${ARCHIVO} (${detalle(e)})`; return; }
+
+  if (colocado) scene.remove(colocado);
+  colocado = base.clone(true);
+  colocado.position.copy(ultimaPos);
+  colocado.scale.setScalar(base.userData.base * escala);
+
+  const cam = renderer.xr.getCamera().position;
+  colocado.rotation.y = Math.atan2(cam.x - ultimaPos.x, cam.z - ultimaPos.z);
+  scene.add(colocado);
+
+  mensaje.textContent = 'Modelo anclado. Camina alrededor para verlo en 360°.';
+}
+
+btnMostrar.addEventListener('click', colocarModelo);
+$('btnMas').addEventListener('click', () => cambiarEscala(1.2));
+$('btnMenos').addEventListener('click', () => cambiarEscala(1 / 1.2));
+$('btnGirar').addEventListener('click', () => { girando = !girando; });
+$('btnBorrar').addEventListener('click', () => {
+  if (colocado) { scene.remove(colocado); colocado = null; }
+  escala = 1; girando = false;
+  mensaje.textContent = 'Apunta al piso y pulsa "Mostrar Modelo aquí"';
+});
+function cambiarEscala(f) {
+  escala *= f;
+  if (colocado && base) colocado.scale.setScalar(base.userData.base * escala);
+}
+
+/* ---------- Sesión AR ---------- */
+async function abrirAR() {
+  if (!renderer) iniciarThree();
+  const intentos = [
+    { requiredFeatures: ['hit-test'], optionalFeatures: ['dom-overlay', 'local-floor'], domOverlay: { root: overlay } },
+    { requiredFeatures: ['hit-test'], optionalFeatures: ['dom-overlay'], domOverlay: { root: overlay } },
+    { requiredFeatures: ['hit-test'] },
+    { optionalFeatures: ['hit-test', 'dom-overlay'], domOverlay: { root: overlay } },
+    {}
+  ];
+  let ultimoError = '';
+  session = null;
+  for (const cfg of intentos) {
+    try { session = await navigator.xr.requestSession('immersive-ar', cfg); break; }
+    catch (e) { ultimoError += (ultimoError ? ' | ' : '') + (e.name || '') + ': ' + (e.message || String(e)); }
+  }
+  if (!session) {
+    $('estadoInicio').textContent = 'No se pudo abrir AR: ' + ultimoError;
+    return;
+  }
+  renderer.xr.setReferenceSpaceType('local');
+  await renderer.xr.setSession(session);
+
+  hitSource = null;
+  try {
+    const viewer = await session.requestReferenceSpace('viewer');
+    hitSource = await session.requestHitTestSource({ space: viewer });
+  } catch (e) { hitSource = null; }
+
+  $('inicio').style.display = 'none';
+  overlay.classList.add('activo');
+  hitDisponible = false;
+  if (hitSource) {
+    btnMostrar.disabled = true;
+    mensaje.textContent = 'Mueve el celular despacio para detectar el piso';
+  } else {
+    btnMostrar.disabled = false;
+    mensaje.textContent = 'Apunta hacia el piso y pulsa "Mostrar Modelo aquí"';
+  }
+  overlay.addEventListener('beforexrselect', e => e.preventDefault());
+  session.addEventListener('select', () => { if (!colocado) colocarModelo(); });
+
+  session.addEventListener('end', () => {
+    session = null; hitSource = null;
+    overlay.classList.remove('activo');
+    $('inicio').style.display = 'flex';
+    if (colocado) { scene.remove(colocado); colocado = null; }
+    reticle.visible = false;
+  });
+}
+$('btnIniciar').addEventListener('click', abrirAR);
+$('salir').addEventListener('click', () => session && session.end());
+
+/* ---------- Arranque ---------- */
+(async () => {
+  const est = $('estadoInicio');
+  if (!navigator.xr) {
+    est.textContent = 'Este navegador no tiene AR. Usa Chrome en Android con HTTPS.';
+    return;
+  }
+  const ok = await navigator.xr.isSessionSupported('immersive-ar').catch(() => false);
+  if (!ok) {
+    est.textContent = 'Tu celular no permite AR aquí. Instala "Servicios de Google Play para RA" y usa Chrome.';
+    return;
+  }
+  $('btnIniciar').disabled = false;
+  precargar();
+})();
+</script>
+</body>
+</html>
